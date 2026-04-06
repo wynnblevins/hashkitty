@@ -32,7 +32,7 @@ def print_banner(message, success=True):
 
 
 # -----------------------------
-# Run Command (safe wrapper)
+# Run Command
 # -----------------------------
 def run_command(cmd):
     try:
@@ -64,7 +64,6 @@ def convert_to_hash(pcap):
 
     output = (result.stdout + result.stderr).lower()
 
-    # 🔑 Skip junk captures
     if "no hashes written" in output:
         log(f"Skipping (no usable handshake): {pcap}", "WARN")
         return None
@@ -78,6 +77,17 @@ def convert_to_hash(pcap):
 
 
 # -----------------------------
+# Combine Hashes
+# -----------------------------
+def combine_hashes(hash_files, combined_file):
+    with open(combined_file, "w") as outfile:
+        for hf in hash_files:
+            with open(hf, "r") as infile:
+                outfile.write(infile.read())
+    return combined_file
+
+
+# -----------------------------
 # Run Hashcat (interactive)
 # -----------------------------
 def run_hashcat(hash_file, wordlist):
@@ -87,7 +97,6 @@ def run_hashcat(hash_file, wordlist):
     log("Press 's' for status, 'q' to quit", "INFO")
 
     try:
-        # 🔥 Interactive mode (no stdout capture!)
         subprocess.run([
             "hashcat",
             "-m", "22000",
@@ -96,7 +105,6 @@ def run_hashcat(hash_file, wordlist):
             "--potfile-path", potfile
         ])
 
-        # Check results after run
         result = subprocess.run([
             "hashcat",
             "-m", "22000",
@@ -106,9 +114,9 @@ def run_hashcat(hash_file, wordlist):
         ], stdout=subprocess.PIPE, text=True)
 
         if result.stdout.strip():
-            return result.stdout.strip()
+            return result.stdout.strip().splitlines()
 
-        return None
+        return []
 
     finally:
         if os.path.exists(potfile):
@@ -116,16 +124,21 @@ def run_hashcat(hash_file, wordlist):
 
 
 # -----------------------------
-# Parse hashcat output
+# Parse Results
 # -----------------------------
-def parse_hashcat_output(line):
-    try:
-        parts = line.split(":")
-        password = parts[-1]
-        essid = parts[-2]
-        return essid, password
-    except:
-        return None, None
+def parse_hashcat_output(lines):
+    results = []
+
+    for line in lines:
+        try:
+            parts = line.split(":")
+            password = parts[-1]
+            essid = parts[-2]
+            results.append((essid, password))
+        except:
+            continue
+
+    return results
 
 
 # -----------------------------
@@ -150,44 +163,64 @@ def main():
 
     log(f"Found {len(pcaps)} pcap files")
 
-    cracked_count = 0
+    hash_files = []
 
+    # -----------------------------
+    # Phase 1: Convert all pcaps
+    # -----------------------------
     for i, pcap in enumerate(pcaps, 1):
         log(f"[{i}/{len(pcaps)}] Processing {pcap}")
 
         try:
-            hash_file = convert_to_hash(pcap)
-
-            if not hash_file:
-                continue  # skip invalid pcaps
-
-            result = run_hashcat(hash_file, wordlist)
-
-            if result:
-                essid, password = parse_hashcat_output(result)
-
-                if essid and password:
-                    print_banner(f"PASSWORD FOUND! {essid} → {password}", success=True)
-                    log(f"CRACKED → {essid} : {password}", "CRITICAL")
-                    cracked_count += 1
-                else:
-                    print_banner("PASSWORD FOUND (unable to parse details)", success=True)
-                    log(f"Raw result: {result}", "WARN")
-
-            else:
-                print_banner("NO PASSWORD FOUND IN WORDLIST", success=False)
-                log("No match found", "INFO")
-
+            hf = convert_to_hash(pcap)
+            if hf:
+                hash_files.append(hf)
         except Exception as e:
             log(f"Error processing {pcap}: {e}", "ERROR")
 
-        finally:
-            # Cleanup
-            hash_path = f"{pcap}.22000"
-            if os.path.exists(hash_path):
-                os.remove(hash_path)
+    if not hash_files:
+        print_banner("NO VALID HANDSHAKES FOUND", success=False)
+        sys.exit(0)
 
-    log(f"Done. Cracked networks: {cracked_count}/{len(pcaps)}")
+    log(f"Collected {len(hash_files)} valid hash files", "SUCCESS")
+
+    # -----------------------------
+    # Phase 2: Combine hashes
+    # -----------------------------
+    combined_file = "combined.22000"
+    combine_hashes(hash_files, combined_file)
+
+    log(f"Combined hashes into {combined_file}", "INFO")
+
+    # Cleanup individual hash files
+    for hf in hash_files:
+        if os.path.exists(hf):
+            os.remove(hf)
+
+    # -----------------------------
+    # Phase 3: Crack
+    # -----------------------------
+    results = run_hashcat(combined_file, wordlist)
+
+    # Cleanup combined file
+    if os.path.exists(combined_file):
+        os.remove(combined_file)
+
+    # -----------------------------
+    # Phase 4: Results
+    # -----------------------------
+    parsed = parse_hashcat_output(results)
+
+    if parsed:
+        print_banner(f"CRACKED {len(parsed)} NETWORK(S)!", success=True)
+
+        for essid, password in parsed:
+            log(f"{essid} → {password}", "CRITICAL")
+
+    else:
+        print_banner("NO PASSWORDS FOUND", success=False)
+
+    log("Done!")
 
 
 if __name__ == "__main__":
