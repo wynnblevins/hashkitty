@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+# -----------------------------
+# Logging
+# -----------------------------
+def log(msg, level="INFO"):
+    print(f"[{time.strftime('%H:%M:%S')}] [{level}] {msg}")
+
+
+def print_usage():
+    print("""
+====================================================
+                HASHKITTY - HELP
+====================================================
+
+Usage:
+  python hashkitty.py <mode> [options]
+
+----------------------------------------------------
+ATTACK MODES
+----------------------------------------------------
+
+[1] WORDLIST
+  wordlist <wordlist_file>
+
+  Runs a dictionary attack using the provided wordlist.
+
+  Example:
+    python hashkitty.py wordlist rockyou.txt
+
+
+[2] MASK (BRUTE FORCE)
+  mask <mask>
+
+  Runs a pure brute-force attack using a mask.
+
+  Common masks:
+    ?d = digit (0-9)
+    ?l = lowercase (a-z)
+    ?u = uppercase (A-Z)
+    ?a = all printable characters
+
+  Examples:
+    python hashkitty.py mask ?d?d?d?d?d?d?d?d
+    python hashkitty.py mask ?l?l?l?l?d?d
+
+
+[3] HYBRID (WORD + MASK)
+  hybrid <wordlist_file> <mask>
+
+  Appends the mask to each word in the wordlist.
+
+  Example:
+    python hashkitty.py hybrid rockyou.txt ?d?d
+
+  This will try:
+    password00
+    password01
+    ...
+    password99
+
+
+[4] HYBRID REVERSE (MASK + WORD)
+  hybrid_reverse <wordlist_file> <mask>
+
+  Prepends the mask to each word in the wordlist.
+
+  Example:
+    python hashkitty.py hybrid_reverse rockyou.txt ?d?d
+
+  This will try:
+    00password
+    01password
+    ...
+    99password
+
+
+----------------------------------------------------
+IMPORTANT CONCEPTS
+----------------------------------------------------
+
+• Hybrid attacks MULTIPLY keyspace:
+    total = wordlist_size × mask_combinations
+
+• DO NOT use large masks with hybrid:
+    BAD:  ?a?a?a?a?a?a?d?d   (too large)
+    GOOD: ?d?d or ?d?d?d
+
+• If you want brute force, use MASK mode instead.
+
+
+----------------------------------------------------
+RECOMMENDED WORKFLOW
+----------------------------------------------------
+
+1. Wordlist attack:
+    python hashkitty.py wordlist rockyou.txt
+
+2. Hybrid (common patterns):
+    python hashkitty.py hybrid rockyou.txt ?d?d
+    python hashkitty.py hybrid rockyou.txt 2024
+
+3. Reverse hybrid:
+    python hashkitty.py hybrid_reverse rockyou.txt ?d?d
+
+4. Targeted brute force:
+    python hashkitty.py mask ?d?d?d?d?d?d?d?d
+
+
+----------------------------------------------------
+INTERACTIVE CONTROLS (HASHCAT)
+----------------------------------------------------
+
+While running:
+
+  s = show status
+  q = quit
+  p = pause/resume
+
+
+----------------------------------------------------
+NOTES
+----------------------------------------------------
+
+• Only valid PCAPs with usable handshakes are processed
+• Duplicate networks are automatically removed
+• All hashes are combined into a single optimized run
+
+====================================================
+""")
+
+
+# -----------------------------
+# Banner Output
+# -----------------------------
+def print_banner(message, success=True):
+    GREEN = "\033[92m"
+    RED = "\033[91m"
+    RESET = "\033[0m"
+
+    color = GREEN if success else RED
+    border_char = "=" if success else "!"
+
+    border = border_char * (len(message) + 10)
+
+    print("\n" + color + border)
+    print(f"   {message}")
+    print(border + RESET + "\n")
+
+
+# -----------------------------
+# Run Command
+# -----------------------------
+def run_command(cmd):
+    try:
+        return subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+    except Exception as e:
+        log(f"Command failed: {e}", "ERROR")
+        return None
+
+
+# -----------------------------
+# Convert PCAP → 22000
+# -----------------------------
+def convert_to_hash(pcap):
+    hash_file = f"{pcap}.22000"
+
+    result = run_command([
+        "hcxpcapngtool",
+        "-o", hash_file,
+        pcap
+    ])
+
+    if result is None:
+        return None
+
+    output = (result.stdout + result.stderr).lower()
+
+    if "no hashes written" in output:
+        log(f"Skipping (no usable handshake): {pcap}", "WARN")
+        return None
+
+    if not os.path.exists(hash_file) or os.path.getsize(hash_file) == 0:
+        log(f"Skipping (empty hash file): {pcap}", "WARN")
+        return None
+
+    log(f"Valid hash extracted: {hash_file}", "SUCCESS")
+    return hash_file
+
+
+# -----------------------------
+# Extract ESSID
+# -----------------------------
+def extract_essid_from_22000(line):
+    try:
+        parts = line.strip().split("*")
+        return parts[5]
+    except:
+        return None
+
+
+# -----------------------------
+# Deduplicate
+# -----------------------------
+def deduplicate_hashes(hash_files, combined_file):
+    seen_essids = set()
+    kept = 0
+    skipped = 0
+
+    with open(combined_file, "w") as outfile:
+        for hf in hash_files:
+            with open(hf, "r") as infile:
+                for line in infile:
+                    essid = extract_essid_from_22000(line)
+
+                    if not essid:
+                        continue
+
+                    if essid in seen_essids:
+                        skipped += 1
+                        continue
+
+                    seen_essids.add(essid)
+                    outfile.write(line)
+                    kept += 1
+
+    log(f"Deduplicated hashes: kept={kept}, skipped={skipped}", "INFO")
+    return combined_file
+
+
+# -----------------------------
+# Run Hashcat
+# -----------------------------
+def run_hashcat(hash_file, mode, args):
+    potfile = tempfile.NamedTemporaryFile(delete=False).name
+
+    log(f"Running hashcat on {hash_file}", "STEP")
+    log("Press 's' for status, 'q' to quit", "INFO")
+
+    try:
+        if mode == "wordlist":
+            cmd = [
+                "hashcat",
+                "-m", "22000",
+                hash_file,
+                args["wordlist"],
+                "--potfile-path", potfile
+            ]
+
+        elif mode == "mask":
+            cmd = [
+                "hashcat",
+                "-m", "22000",
+                "-a", "3",
+                hash_file,
+                args["mask"],
+                "--potfile-path", potfile
+            ]
+
+        elif mode == "hybrid":
+            cmd = [
+                "hashcat",
+                "-m", "22000",
+                "-a", "6",
+                hash_file,
+                args["wordlist"],
+                args["mask"],
+                "--potfile-path", potfile
+            ]
+
+        elif mode == "hybrid_reverse":
+            cmd = [
+                "hashcat",
+                "-m", "22000",
+                "-a", "7",
+                hash_file,
+                args["mask"],      # 👈 MASK FIRST
+                args["wordlist"],  # 👈 WORDLIST SECOND
+                "--potfile-path", potfile
+            ]
+
+        else:
+            log("Invalid mode in run_hashcat()", "ERROR")
+            return []
+
+        subprocess.run(cmd)
+
+        result = subprocess.run([
+            "hashcat",
+            "-m", "22000",
+            hash_file,
+            "--show",
+            "--potfile-path", potfile
+        ], stdout=subprocess.PIPE, text=True)
+
+        if result.stdout.strip():
+            return result.stdout.strip().splitlines()
+
+        return []
+
+    finally:
+        if os.path.exists(potfile):
+            os.remove(potfile)
+
+
+# -----------------------------
+# Parse Results
+# -----------------------------
+def parse_hashcat_output(lines):
+    results = []
+
+    for line in lines:
+        try:
+            parts = line.split(":")
+            password = parts[-1]
+            essid = parts[-2]
+            results.append((essid, password))
+        except:
+            continue
+
+    return results
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    if len(sys.argv) < 2:
+        print_usage()
+        sys.exit(0)
+
+    mode = sys.argv[1]
+    args = {}
+
+    if mode == "wordlist":
+        if len(sys.argv) < 3:
+            print_usage()
+            sys.exit(1)
+        args["wordlist"] = sys.argv[2]
+
+    elif mode == "mask":
+        if len(sys.argv) < 3:
+            print_usage()
+            sys.exit(1)
+        args["mask"] = sys.argv[2]
+
+    elif mode == "hybrid":
+        if len(sys.argv) < 4:
+            print_usage()
+            sys.exit(1)
+        args["wordlist"] = sys.argv[2]
+        args["mask"] = sys.argv[3]
+
+    elif mode == "hybrid_reverse":
+        if len(sys.argv) < 4:
+            print_usage()
+            sys.exit(1)
+        args["wordlist"] = sys.argv[2]
+        args["mask"] = sys.argv[3]
+
+    else:
+        print_usage()
+        sys.exit(1)
+
+    pcaps = [f for f in os.listdir(".") if f.endswith(".pcap")]
+
+    if not pcaps:
+        log("No pcap files found", "ERROR")
+        sys.exit(1)
+
+    log(f"Found {len(pcaps)} pcap files")
+
+    hash_files = []
+
+    for i, pcap in enumerate(pcaps, 1):
+        log(f"[{i}/{len(pcaps)}] Processing {pcap}")
+
+        hf = convert_to_hash(pcap)
+        if hf:
+            hash_files.append(hf)
+
+    if not hash_files:
+        print_banner("NO VALID HANDSHAKES FOUND", success=False)
+        sys.exit(0)
+
+    combined_file = "combined.22000"
+    deduplicate_hashes(hash_files, combined_file)
+
+    for hf in hash_files:
+        if os.path.exists(hf):
+            os.remove(hf)
+
+    results = run_hashcat(combined_file, mode, args)
+
+    if os.path.exists(combined_file):
+        os.remove(combined_file)
+
+    parsed = parse_hashcat_output(results)
+
+    if parsed:
+        print_banner(f"CRACKED {len(parsed)} NETWORK(S)!", success=True)
+        for essid, password in parsed:
+            log(f"{essid} → {password}", "CRITICAL")
+    else:
+        print_banner("NO PASSWORDS FOUND", success=False)
+
+    log("Done!")
+
+
+if __name__ == "__main__":
+    main()
